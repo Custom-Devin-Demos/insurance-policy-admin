@@ -9,6 +9,9 @@
       * Modified: 2005-03-01 - Added auto-renewal logic
       *           2012-11-15 - Added rate increase cap (regulatory)
       *           2020-02-01 - COVID grace period extension
+      *           2026-11-20 - Branch authorization via QUERY SECURITY
+      *                        on FACILITY PAS.BRANCH.<branch-code>;
+      *                        UPDATED_BY records signed-on user ID
       *
       * Processes policy renewals. Reads expiring policy, validates
       * renewal eligibility, applies rate changes, creates new term.
@@ -35,6 +38,14 @@
        01  WS-COVID-GRACE            PIC X(01) VALUE 'N'.
            88  COVID-GRACE-YES       VALUE 'Y'.
            88  COVID-GRACE-NO        VALUE 'N'.
+      * Branch-level authorization (ESM FACILITY class profile)
+       01  WS-USERID                 PIC X(08) VALUE SPACES.
+       01  WS-BRANCH-IND             PIC S9(04) COMP VALUE 0.
+       01  WS-SEC-UPDATE             PIC S9(08) COMP VALUE 0.
+       01  WS-SEC-RESID-LEN          PIC S9(08) COMP VALUE 15.
+       01  WS-SEC-RESID.
+           05  FILLER                PIC X(11) VALUE 'PAS.BRANCH.'.
+           05  WS-SEC-RESID-BRANCH   PIC X(04) VALUE SPACES.
 
        COPY POLICY-RECORD.
        COPY COVERAGE-RECORD.
@@ -50,14 +61,19 @@
            PERFORM 1000-INITIALIZE
            PERFORM 2000-READ-EXISTING-POLICY
            IF WS-ERROR-MSG = SPACES
+               PERFORM 2500-CHECK-AUTHORIZATION
+           END-IF
+           IF WS-ERROR-MSG = SPACES
                PERFORM 3000-CHECK-RENEWAL-ELIGIBILITY
            END-IF
            IF WS-ERROR-MSG = SPACES
                PERFORM 4000-CALCULATE-NEW-PREMIUM
                PERFORM 5000-APPLY-RATE-CAP
                PERFORM 6000-CREATE-RENEWAL-TERM
-               PERFORM 7000-UPDATE-COVERAGES
-               PERFORM 8000-SEND-CONFIRMATION
+               IF WS-ERROR-MSG = SPACES
+                   PERFORM 7000-UPDATE-COVERAGES
+                   PERFORM 8000-SEND-CONFIRMATION
+               END-IF
            ELSE
                PERFORM 9000-SEND-ERROR
            END-IF
@@ -73,9 +89,20 @@
                ABSTIME(WS-CURRENT-DATE)
                YYYYMMDD(WS-CURRENT-DATE)
            END-EXEC
+           EXEC CICS ASSIGN
+               USERID(WS-USERID)
+               RESP(WS-RESPONSE-CODE)
+           END-EXEC
+           IF WS-RESPONSE-CODE NOT = DFHRESP(NORMAL)
+              OR WS-USERID = SPACES
+               MOVE 'UNABLE TO DETERMINE SIGNED-ON USER' TO WS-ERROR-MSG
+           END-IF
            .
 
        2000-READ-EXISTING-POLICY.
+           IF WS-ERROR-MSG NOT = SPACES
+               GO TO 2000-EXIT
+           END-IF
            EXEC CICS RECEIVE
                MAP('POLRMAP')
                MAPSET('POLRMAPS')
@@ -89,10 +116,11 @@
            EXEC SQL
                SELECT POLICY_NUMBER, POLICY_TYPE, POLICY_STATUS,
                       TOTAL_PREMIUM, EXPIRY_DATE, RENEWAL_COUNT,
-                      UW_STATUS
+                      UW_STATUS, BRANCH_CODE
                INTO :POLICY-NUMBER, :POLICY-TYPE, :POLICY-STATUS,
                     :POLICY-TOTAL-PREMIUM, :POLICY-EXPIRY-DATE,
-                    :POLICY-RENEWAL-COUNT, :POLICY-UW-STATUS
+                    :POLICY-RENEWAL-COUNT, :POLICY-UW-STATUS,
+                    :POLICY-BRANCH-CODE :WS-BRANCH-IND
                FROM POLICIES
                WHERE POLICY_NUMBER = :POLICY-NUMBER
            END-EXEC
@@ -101,6 +129,31 @@
            END-IF
            .
        2000-EXIT.
+           EXIT.
+
+       2500-CHECK-AUTHORIZATION.
+      *    Signed-on user must have UPDATE access to the policy's
+      *    branch profile. Missing branch or ESM error denies.
+           IF WS-BRANCH-IND < 0 OR POLICY-BRANCH-CODE = SPACES
+               MOVE 'NOT AUTHORIZED TO RENEW THIS POLICY'
+                   TO WS-ERROR-MSG
+               GO TO 2500-EXIT
+           END-IF
+           MOVE POLICY-BRANCH-CODE TO WS-SEC-RESID-BRANCH
+           EXEC CICS QUERY SECURITY
+               RESCLASS('FACILITY')
+               RESID(WS-SEC-RESID)
+               RESIDLENGTH(WS-SEC-RESID-LEN)
+               UPDATE(WS-SEC-UPDATE)
+               RESP(WS-RESPONSE-CODE)
+           END-EXEC
+           IF WS-RESPONSE-CODE NOT = DFHRESP(NORMAL)
+              OR WS-SEC-UPDATE NOT = DFHVALUE(UPDATABLE)
+               MOVE 'NOT AUTHORIZED TO RENEW THIS POLICY'
+                   TO WS-ERROR-MSG
+           END-IF
+           .
+       2500-EXIT.
            EXIT.
 
        3000-CHECK-RENEWAL-ELIGIBILITY.
@@ -160,11 +213,13 @@
                    RENEWAL_COUNT = :POLICY-RENEWAL-COUNT,
                    UW_STATUS = :POLICY-UW-STATUS,
                    LAST_UPDATED = CURRENT TIMESTAMP,
-                   UPDATED_BY = 'POLRNW'
+                   UPDATED_BY = :WS-USERID
                WHERE POLICY_NUMBER = :POLICY-NUMBER
+                 AND BRANCH_CODE = :POLICY-BRANCH-CODE
            END-EXEC
-           IF SQLCODE NOT = 0
+           IF SQLCODE NOT = 0 OR SQLERRD(3) NOT = 1
                MOVE 'DB2 ERROR UPDATING RENEWAL' TO WS-ERROR-MSG
+               EXEC CICS SYNCPOINT ROLLBACK END-EXEC
                PERFORM 9000-SEND-ERROR
            END-IF
            .
