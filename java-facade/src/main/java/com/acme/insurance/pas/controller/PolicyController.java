@@ -24,8 +24,7 @@ import java.util.List;
  *   GET /api/v1/policies/{policyNumber}           - Policy details
  *   GET /api/v1/policies/{policyNumber}/coverages  - Coverage details
  *
- * NOTE: No authentication on these endpoints - relies on network
- * segmentation (internal VPN only). TODO: Add OAuth2 in Phase 2.
+ * Callers must authenticate as the PAS API client (see SecurityConfig).
  *
  * @author T. Nguyen (2022)
  */
