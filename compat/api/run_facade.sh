@@ -7,6 +7,13 @@ MODULE="${COMPAT_API_MODULE:-java-facade}"
 PORT="${COMPAT_PORT:-18080}"
 (cd "$MODULE" && mvn -B -ntp -q -DskipTests package)
 JAR=$(ls "$MODULE"/target/*.jar | grep -v original | head -1)
+# The default facade only accepts its own API client credentials; give it throwaway ones and
+# authenticate the contract check with them. COMPAT_AUTH_HEADER is kept for COMPAT_API_START services.
+if [ -z "${COMPAT_API_START:-}" ]; then
+  export PAS_API_CLIENT_ID="${PAS_API_CLIENT_ID:-compat-gate}"
+  export PAS_API_CLIENT_SECRET="${PAS_API_CLIENT_SECRET:-$(head -c 24 /dev/urandom | base64 | tr -d '/+=')}"
+  export COMPAT_AUTH_HEADER="Authorization: Basic $(printf '%s:%s' "$PAS_API_CLIENT_ID" "$PAS_API_CLIENT_SECRET" | base64 | tr -d '\n')"
+fi
 START="${COMPAT_API_START:-java -jar $JAR --spring.profiles.active=local --server.port=$PORT}"
 $START > compat-api.log 2>&1 &
 PID=$!
