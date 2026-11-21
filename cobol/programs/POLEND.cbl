@@ -8,6 +8,8 @@
       * Date:     1999-02-10
       * Modified: 2007-04-15 - Added mid-term cancellation
       *           2016-08-01 - Added endorsement audit trail
+      *           2026-11-20 - Branch authorization via QUERY SECURITY;
+      *                        record signed-on user as actor
       *
       * Processes policy endorsements (changes to existing policy):
       * - Coverage additions/removals
@@ -36,6 +38,15 @@
            88  END-TYPE-LMT-CHG       VALUE 'LCH'.
            88  END-TYPE-ADDR-CHG      VALUE 'ACH'.
            88  END-TYPE-CANCEL        VALUE 'CAN'.
+       01  WS-USERID                 PIC X(08) VALUE SPACES.
+       01  WS-REQ-POLICY-NUMBER      PIC X(12) VALUE SPACES.
+      *    RACF resource per branch, e.g. PAS.BRANCH.BOS1 in PASBRNCH
+       01  WS-SEC-RESCLASS           PIC X(08) VALUE 'PASBRNCH'.
+       01  WS-SEC-RESID.
+           05  FILLER                PIC X(11) VALUE 'PAS.BRANCH.'.
+           05  WS-SEC-RESID-BRANCH   PIC X(04) VALUE SPACES.
+       01  WS-SEC-RESID-LEN          PIC S9(08) COMP VALUE 15.
+       01  WS-SEC-UPDATE             PIC S9(08) COMP VALUE 0.
 
        COPY POLICY-RECORD.
        COPY COVERAGE-RECORD.
@@ -50,14 +61,20 @@
            PERFORM 1000-INITIALIZE
            PERFORM 2000-RECEIVE-ENDORSEMENT
            IF WS-ERROR-MSG = SPACES
+               PERFORM 2500-AUTHORIZE-POLICY-ACCESS
+           END-IF
+           IF WS-ERROR-MSG = SPACES
                PERFORM 3000-VALIDATE-ENDORSEMENT
            END-IF
            IF WS-ERROR-MSG = SPACES
                PERFORM 4000-CALCULATE-PRORATA
                PERFORM 5000-APPLY-ENDORSEMENT
+           END-IF
+           IF WS-ERROR-MSG = SPACES
                PERFORM 6000-WRITE-AUDIT-TRAIL
                PERFORM 7000-SEND-CONFIRMATION
            ELSE
+               EXEC CICS SYNCPOINT ROLLBACK END-EXEC
                PERFORM 8000-SEND-ERROR
            END-IF
            PERFORM 9999-RETURN
@@ -70,9 +87,21 @@
                ABSTIME(WS-CURRENT-DATE)
                YYYYMMDD(WS-CURRENT-DATE)
            END-EXEC
+           EXEC CICS ASSIGN
+               USERID(WS-USERID)
+               RESP(WS-RESPONSE-CODE)
+           END-EXEC
+           IF WS-RESPONSE-CODE NOT = DFHRESP(NORMAL)
+              OR WS-USERID = SPACES
+               MOVE 'UNABLE TO DETERMINE SIGNED-ON USER'
+                   TO WS-ERROR-MSG
+           END-IF
            .
 
        2000-RECEIVE-ENDORSEMENT.
+           IF WS-ERROR-MSG NOT = SPACES
+               EXIT PARAGRAPH
+           END-IF
            EXEC CICS RECEIVE
                MAP('POLEMAP')
                MAPSET('POLEMAPS')
@@ -82,21 +111,52 @@
            IF WS-RESPONSE-CODE NOT = DFHRESP(NORMAL)
                MOVE 'ERROR RECEIVING ENDORSEMENT DATA'
                    TO WS-ERROR-MSG
+               EXIT PARAGRAPH
            END-IF
+      *    Only the policy number is taken from the screen; every
+      *    other policy field comes from DB2 so the audit copy and
+      *    authorization check cannot use caller-supplied values.
+           MOVE POLICY-NUMBER TO WS-REQ-POLICY-NUMBER
+           INITIALIZE POLICY-RECORD
       *    Read current policy from DB2
            EXEC SQL
                SELECT POLICY_NUMBER, POLICY_STATUS,
                       EFFECTIVE_DATE, EXPIRY_DATE,
+                      AGENT_CODE, BRANCH_CODE,
                       TOTAL_PREMIUM
                INTO :POLICY-NUMBER, :POLICY-STATUS,
                     :POLICY-EFFECTIVE-DATE, :POLICY-EXPIRY-DATE,
+                    :POLICY-AGENT-CODE, :POLICY-BRANCH-CODE,
                     :POLICY-TOTAL-PREMIUM
                FROM POLICIES
-               WHERE POLICY_NUMBER = :POLICY-NUMBER
+               WHERE POLICY_NUMBER = :WS-REQ-POLICY-NUMBER
                WITH RS USE AND KEEP UPDATE LOCKS
            END-EXEC
            IF SQLCODE NOT = 0
                MOVE 'POLICY NOT FOUND' TO WS-ERROR-MSG
+           END-IF
+           .
+
+       2500-AUTHORIZE-POLICY-ACCESS.
+      *    Signed-on user must hold UPDATE on the policy's branch
+      *    resource before any endorsement is written.
+           IF POLICY-BRANCH-CODE = SPACES
+               MOVE 'NOT AUTHORIZED TO ENDORSE THIS POLICY'
+                   TO WS-ERROR-MSG
+               EXIT PARAGRAPH
+           END-IF
+           MOVE POLICY-BRANCH-CODE TO WS-SEC-RESID-BRANCH
+           EXEC CICS QUERY SECURITY
+               RESCLASS(WS-SEC-RESCLASS)
+               RESID(WS-SEC-RESID)
+               RESIDLENGTH(WS-SEC-RESID-LEN)
+               UPDATE(WS-SEC-UPDATE)
+               RESP(WS-RESPONSE-CODE)
+           END-EXEC
+           IF WS-RESPONSE-CODE NOT = DFHRESP(NORMAL)
+              OR WS-SEC-UPDATE NOT = DFHVALUE(UPDATABLE)
+               MOVE 'NOT AUTHORIZED TO ENDORSE THIS POLICY'
+                   TO WS-ERROR-MSG
            END-IF
            .
 
@@ -147,11 +207,12 @@
                (:POLICY-NUMBER, :WS-ENDORSEMENT-SEQ,
                 :WS-ENDORSEMENT-TYPE, :WS-CURRENT-DATE,
                 :WS-PREMIUM-ADJUST, CURRENT TIMESTAMP,
-                'POLEND')
+                :WS-USERID)
            END-EXEC
            IF SQLCODE NOT = 0
                MOVE 'DB2 ERROR INSERTING ENDORSEMENT'
                    TO WS-ERROR-MSG
+               EXIT PARAGRAPH
            END-IF
 
       *    Update policy premium
@@ -161,9 +222,15 @@
                UPDATE POLICIES
                SET TOTAL_PREMIUM = :POLICY-TOTAL-PREMIUM,
                    LAST_UPDATED = CURRENT TIMESTAMP,
-                   UPDATED_BY = 'POLEND'
+                   UPDATED_BY = :WS-USERID
                WHERE POLICY_NUMBER = :POLICY-NUMBER
            END-EXEC
+           IF SQLCODE NOT = 0
+               MOVE 'DB2 ERROR UPDATING POLICY PREMIUM'
+                   TO WS-ERROR-MSG
+               EXIT PARAGRAPH
+           END-IF
+           MOVE WS-USERID TO POLICY-UPDATED-BY
            .
 
        6000-WRITE-AUDIT-TRAIL.
