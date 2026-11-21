@@ -9,6 +9,8 @@
 //* Date:     1999-03-01
 //* Modified: 2008-07-01 - Added catastrophe zone data
 //*           2015-01-15 - Added cyber exposure fields
+//*           2026-11-20 - STEP020 now uses SFTP (SSH) with public-key
+//*                        auth instead of plaintext FTP.
 //*
 //* Extracts monthly exposure data for actuarial analysis.
 //* Output is consumed by SAS programs for loss reserving
@@ -58,15 +60,38 @@
 /*
 //*
 //*-------------------------------------------------------------------
-//* STEP020 - Copy to actuarial shared drive
+//* STEP020 - SFTP exposure extract to actuarial server
+//*   Encrypted (SSH) transfer with public-key auth only; no password
+//*   is sent or stored. The actuarial server host key must already
+//*   be in the batch user's ~/.ssh/known_hosts
+//*   (StrictHostKeyChecking=yes),
+//*   and SFTP_KEY must be readable only by the batch user.
+//*   Skipped unless STEP010 ended RC=0 so partial extracts are never
+//*   sent.
 //*-------------------------------------------------------------------
-//STEP020  EXEC PGM=FTP,PARM='(EXIT',
-//         COND=(4,LT,STEP010)
-//INPUT    DD *
- ACTUARIAL.ACME.LOCAL
- ACMEFTP
- PUT 'ACME.PAS.EXPOSURE.MONTHLY.D&LYYMMDD' /actuarial/data/exposure_monthly.csv
- QUIT
+//STEP020  EXEC PGM=BPXBATCH,
+//         COND=(0,NE,STEP010)
+//STDOUT   DD SYSOUT=*
+//STDERR   DD SYSOUT=*
+//STDENV   DD *
+SFTP_HOST=ACTUARIAL.ACME.LOCAL
+SFTP_USER=ACMEFTP
+SFTP_KEY=/u/acmebat/.ssh/id_pas_actuarial
 /*
-//OUTPUT   DD SYSOUT=*
+//STDPARM  DD *,SYMBOLS=EXECSYS
+SH set -e;
+ umask 077;
+ W=/tmp/pas0200.$$;
+ mkdir -m 700 "$W";
+ trap 'rm -rf "$W"' EXIT;
+ cp -T "//'ACME.PAS.EXPOSURE.MONTHLY.D&LYYMMDD'" "$W/exp.ebc";
+ iconv -f IBM-1047 -t ISO8859-1 "$W/exp.ebc" > "$W/exp.csv";
+ printf 'put %s %s\n'
+ "$W/exp.csv" /actuarial/data/exposure_monthly.csv |
+ sftp -b - -i "$SFTP_KEY"
+ -o BatchMode=yes -o StrictHostKeyChecking=yes
+ -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no
+ -o PreferredAuthentications=publickey
+ "$SFTP_USER@$SFTP_HOST"
+/*
 //*

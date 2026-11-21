@@ -9,6 +9,10 @@
 //* Date:     1998-09-01
 //* Modified: 2005-03-15 - Added Claims system extract
 //*           2012-11-01 - Added encryption step (regulatory)
+//*           2026-11-20 - The 2012 encryption step was never in this
+//*                        job; extracts went out over plaintext FTP.
+//*                        STEP030 now uses SFTP (SSH) with public-key
+//*                        auth and runs only if all prior steps RC=0.
 //*
 //* Extracts active policy data from DB2 and creates flat files
 //* for consumption by Claims Engine (VB6 batch import) and
@@ -81,17 +85,40 @@
 /*
 //*
 //*-------------------------------------------------------------------
-//* STEP030 - FTP extract files to Claims server
+//* STEP030 - SFTP extract files to Claims server
+//*   Encrypted (SSH) transfer with public-key auth only; no password
+//*   is sent or stored. The claims server host key must already be in
+//*   the batch user's ~/.ssh/known_hosts (StrictHostKeyChecking=yes),
+//*   and SFTP_KEY must be readable only by the batch user.
+//*   Skipped unless every prior step ended RC=0 so partial extracts
+//*   are never sent.
 //*-------------------------------------------------------------------
-//STEP030  EXEC PGM=FTP,PARM='(EXIT',
-//         COND=(4,LT)
-//INPUT    DD *
- CLAIMSRV.ACME.LOCAL
- ACMEFTP
- PUT 'ACME.PAS.EXTRACT.POLICY.DAILY' /claims/import/policy_extract.dat
- PUT 'ACME.PAS.EXTRACT.COVERAGE.DAILY' /claims/import/coverage_extract.dat
- QUIT
+//STEP030  EXEC PGM=BPXBATCH,
+//         COND=(0,NE)
+//STDOUT   DD SYSOUT=*
+//STDERR   DD SYSOUT=*
+//STDENV   DD *
+SFTP_HOST=CLAIMSRV.ACME.LOCAL
+SFTP_USER=ACMEFTP
+SFTP_KEY=/u/acmebat/.ssh/id_pas_claims
 /*
-//OUTPUT   DD SYSOUT=*
-//SYSPRINT DD SYSOUT=*
+//STDPARM  DD *
+SH set -e;
+ umask 077;
+ W=/tmp/pas0100.$$;
+ mkdir -m 700 "$W";
+ trap 'rm -rf "$W"' EXIT;
+ cp -T "//'ACME.PAS.EXTRACT.POLICY.DAILY'" "$W/pol.ebc";
+ cp -T "//'ACME.PAS.EXTRACT.COVERAGE.DAILY'" "$W/cov.ebc";
+ iconv -f IBM-1047 -t ISO8859-1 "$W/pol.ebc" > "$W/pol.dat";
+ iconv -f IBM-1047 -t ISO8859-1 "$W/cov.ebc" > "$W/cov.dat";
+ printf 'put %s %s\nput %s %s\n'
+ "$W/pol.dat" /claims/import/policy_extract.dat
+ "$W/cov.dat" /claims/import/coverage_extract.dat |
+ sftp -b - -i "$SFTP_KEY"
+ -o BatchMode=yes -o StrictHostKeyChecking=yes
+ -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no
+ -o PreferredAuthentications=publickey
+ "$SFTP_USER@$SFTP_HOST"
+/*
 //*
